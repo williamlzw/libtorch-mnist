@@ -1,14 +1,16 @@
 #pragma once
 #include <torch/torch.h>
+#include <torch/csrc/jit/serialization/import.h>
 #include <opencv2/opencv.hpp>
 
 
 #include <string>
 #include <vector>
-#include <Windows.h>
+
 
 void train_mnist();
 void test_model();
+void test_jitmodel();
 
 std::vector<std::tuple<torch::Tensor, torch::Tensor>> ReadRsv(const std::string path);
 
@@ -17,11 +19,15 @@ class MnistDataset : public  torch::data::Dataset<MnistDataset>
 private:
 	std::vector<std::tuple<torch::Tensor, torch::Tensor>> rsv_;
 public:
-	explicit MnistDataset(std::string& file_names_rsv) :rsv_(ReadRsv(file_names_rsv)) {};
+	MnistDataset(std::string& file_names_rsv)
+	{
+		rsv_ = ReadRsv(file_names_rsv);
+	};
 	torch::data::Example<> get(size_t index) override
 	{
 		torch::Tensor line = std::get<0>(rsv_[index]);
 		torch::Tensor label = std::get<1>(rsv_[index]);
+
 		return { line,label };
 	};
 	torch::optional<size_t> size() const override
@@ -45,13 +51,12 @@ struct Mnistmodel : torch::nn::Module {
 		register_module("dropout1", dropout1);
 		//register_module("dropout2", dropout2);
 		register_module("fc1", fc1);
+
 		register_module("fc2", fc2);
 	}
 	torch::Tensor forward(torch::Tensor x) {
 		x = conv1(x);
-		
 		x = torch::max_pool2d(x, { 2,2 });
-		
 		x = torch::relu(x);
 		x = conv2(x);
 		x = dropout1(x);
@@ -60,7 +65,8 @@ struct Mnistmodel : torch::nn::Module {
 		x = x.view({ -1,320 });
 		x = fc1(x);
 		x = torch::relu(x);
-		x = torch::dropout(x, 0.5, true);
+
+		x = torch::dropout(x, 0.5, is_training());
 		x = fc2(x);
 		return torch::log_softmax(x, /*dim=*/1);
 	}
@@ -98,30 +104,22 @@ void train(int32_t epoch, const Options& options, std::shared_ptr<Mnistmodel> mo
 		auto targets = batch.target.to(device);
 		targets = targets.reshape(options.batch_size);
 		optimizer.zero_grad();
-		//std::cout <<"targets" << targets.sizes() << std::endl;
-		//std::cout << data << std::endl;
 		auto output = model->forward(data);
-		//std::cout << "output" << output.sizes() << std::endl;
 		auto loss = torch::nll_loss(output, targets);
 		loss.backward();
 		optimizer.step();
 		batch_idx++;
-		if (batch_idx % options.log_interval == 0) {
+		if ((batch_idx * batch.data.size(0)) % options.log_interval == 0)
+		{
 			std::printf(
 				"\r训练批次: %ld [%5ld/%5ld] Loss: %.6f",
+				//"训练批次: %ld [%5ld/%5ld] Loss: %.6f\r\n",
 				epoch,
 				batch_idx * batch.data.size(0),
 				dataset_size,
 				loss.item<float>());
 		}
-		else {
-			std::printf(
-				"\r训练批次: %ld [%5ld/%5ld] Loss: %.6f",
-				epoch,
-				batch_idx * batch.data.size(0),
-				dataset_size,
-				loss.item<float>());
-		}
+
 	}
 }
 
@@ -136,6 +134,32 @@ void test(const Options& options, std::shared_ptr<Mnistmodel> model, torch::Devi
 		auto targets = batch.target.to(device);
 		targets = targets.reshape(options.test_batch_size);
 		auto output = model->forward(data);
+		test_loss += torch::nll_loss(output, targets,/*weight=*/{}, torch::Reduction::Sum).item<float>();
+		auto pred = output.argmax(1);
+		correct += pred.eq(targets).sum().item<int64_t>();
+	}
+	test_loss /= dataset_size;
+	std::printf(
+		"\n测试: 平均 loss: %.6f | 置信率: %.6f\n",
+		//"测试:平均 loss: %.6f | 置信率: %.6f;\r\n",
+		test_loss,
+		static_cast<float>(correct) / dataset_size);
+}
+
+template <typename DataLoader>
+void testmnistjit(int64_t test_batch_size, std::shared_ptr<torch::jit::script::Module> model, torch::Device device, DataLoader& data_loader, size_t dataset_size)
+{
+	model->eval();
+	float test_loss = 0;
+	int64_t correct = 0;
+	for (const auto& batch : data_loader) {
+		auto data = batch.data.to(device);
+		auto targets = batch.target.to(device);
+		targets = targets.reshape(test_batch_size);
+		std::vector<torch::jit::IValue> jitdata;
+		jitdata.push_back(data);
+		auto output = model->forward(jitdata).toTensor();
+		//std::cout << output << std::endl;
 		test_loss += torch::nll_loss(output, targets,/*weight=*/{}, torch::Reduction::Sum).item<float>();
 		auto pred = output.argmax(1);
 		correct += pred.eq(targets).sum().item<int64_t>();
